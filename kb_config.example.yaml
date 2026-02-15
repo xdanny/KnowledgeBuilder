@@ -77,6 +77,8 @@ indexing:
   # Example: uv run python scripts/contextualize_chunk_stub.py
   contextualizer_command:
   contextualizer_max_context_chars: 320
+  graph_db_path: .kb_state/graph.db
+  impact_reindex_enabled: true
 
 bootstrap:
   knowledge_base_name: de-knowledge-base

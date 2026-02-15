@@ -5,6 +5,7 @@ __all__ = [
     "extractor",
     "contextual_retrieval",
     "git_utils",
+    "graph_store",
     "state_store",
     "planner",
     "embeddings",

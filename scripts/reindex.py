@@ -12,13 +12,18 @@ import boto3
 from kb_indexer.backends import build_backend
 from kb_indexer.contextual_retrieval import contextualize_document
 from kb_indexer.extractor import (
+    StructuredFacts,
     analyze_artifact,
+    build_architecture_document,
     build_artifact_document,
-    build_structured_documents,
+    build_metric_document,
+    build_table_document,
+    compute_file_hash,
     iter_files,
     load_glue_catalog,
 )
 from kb_indexer.git_utils import commit_exists, list_all_files, parse_git_changes, resolve_sha
+from kb_indexer.graph_store import GraphStore
 from kb_indexer.planner import build_plan
 from kb_indexer.settings import AppSettings, RepoSettings, load_settings
 from kb_indexer.state_store import LocalFileStateStore, S3StateStore, StateStore
@@ -33,19 +38,24 @@ class RepoRunResult:
     changed_files: int
     deleted_files: int
     indexed_docs: int
+    parsed_files: int
+    hash_skipped_files: int
+    impacted_tables: int
+    impacted_metrics: int
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Incremental multi-repo indexing for AWS Bedrock KB or local FAISS backend."
+            "Incremental multi-repo indexing with graph-based impact reindexing "
+            "for AWS Bedrock KB or local FAISS backend."
         )
     )
     parser.add_argument("--config", default="kb_config.yaml", help="Path to config YAML.")
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Ignore saved state and index all tracked files for all repositories.",
+        help="Ignore saved state and rebuild graph/docs for all files in each repository.",
     )
     parser.add_argument(
         "--repos",
@@ -101,13 +111,13 @@ def _filter_allowed(
     repo_root: Path,
     include_ext: list[str],
     exclude_dirs: list[str],
-    changed_paths: list[str],
+    paths: list[str],
 ) -> list[str]:
     allowed_paths = {
         path.relative_to(repo_root).as_posix()
         for path in iter_files(repo_root, include_ext, exclude_dirs)
     }
-    return sorted({path for path in changed_paths if path in allowed_paths})
+    return sorted({path for path in paths if path in allowed_paths})
 
 
 def _doc_source_path(repo_name: str, repo_relative_path: str) -> str:
@@ -133,6 +143,93 @@ def _with_contextual_sections(source_path: str, content: str, settings: AppSetti
     return "\n".join(lines)
 
 
+def _collect_impacted_from_facts(
+    facts: dict[str, Any] | None,
+    impacted_tables: set[str],
+    impacted_metrics: set[str],
+) -> None:
+    if not facts:
+        return
+    for table_name in facts.get("reads", []):
+        impacted_tables.add(str(table_name).lower())
+    for table_name in facts.get("writes", []):
+        impacted_tables.add(str(table_name).lower())
+    for metric in facts.get("metrics", []):
+        metric_name = str(metric.get("name", "")).lower().strip()
+        if metric_name:
+            impacted_metrics.add(metric_name)
+
+
+def _build_structured_docs_from_graph(
+    *,
+    repo_name: str,
+    commit_sha: str,
+    graph_store: GraphStore,
+    glue_catalog: dict[str, dict[str, Any]],
+    impacted_tables: set[str],
+    impacted_metrics: set[str],
+    force_all: bool,
+) -> tuple[list[Any], list[str]]:
+    docs = []
+    stale_paths: list[str] = []
+
+    table_candidates = set(graph_store.list_tables(repo_name)) if force_all else set(impacted_tables)
+    metric_candidates = set(graph_store.list_metrics(repo_name)) if force_all else set(impacted_metrics)
+
+    for table_name in sorted(table_candidates):
+        usage = graph_store.get_table_usage(repo_name, table_name)
+        table_doc_path = f"{repo_name}/entities/tables/{table_name}.md"
+        if not usage.get("reads") and not usage.get("writes"):
+            stale_paths.append(table_doc_path)
+            continue
+        docs.append(
+            build_table_document(
+                repo_name=repo_name,
+                table_name=table_name,
+                usage=usage,
+                glue_catalog=glue_catalog,
+                commit_sha=commit_sha,
+            )
+        )
+
+    for metric_name in sorted(metric_candidates):
+        definitions = graph_store.get_metric_definitions(repo_name, metric_name)
+        metric_doc_path = f"{repo_name}/entities/metrics/{metric_name}.md"
+        if not definitions:
+            stale_paths.append(metric_doc_path)
+            continue
+        docs.append(
+            build_metric_document(
+                repo_name=repo_name,
+                metric_name=metric_name,
+                definitions=definitions,
+                commit_sha=commit_sha,
+            )
+        )
+
+    all_tables = {
+        table_name: graph_store.get_table_usage(repo_name, table_name)
+        for table_name in graph_store.list_tables(repo_name)
+    }
+    all_metrics = {
+        metric_name: graph_store.get_metric_definitions(repo_name, metric_name)
+        for metric_name in graph_store.list_metrics(repo_name)
+    }
+    architecture_doc = build_architecture_document(
+        repo_name=repo_name,
+        commit_sha=commit_sha,
+        facts=StructuredFacts(
+            tables=all_tables,
+            metrics=all_metrics,
+            top_files=graph_store.get_top_files(repo_name, limit=20),
+            call_edges=graph_store.get_call_edges(repo_name, limit=200),
+            file_count=graph_store.get_repo_file_count(repo_name),
+        ),
+    )
+    docs.append(architecture_doc)
+    return docs, stale_paths
+
+
 def _run_repo(
     *,
     repo: RepoSettings,
@@ -140,6 +237,7 @@ def _run_repo(
     state_store: StateStore,
     glue_catalog: dict[str, dict[str, Any]],
     backend: Any,
+    graph_store: GraphStore,
     full: bool,
 ) -> RepoRunResult:
     repo_root = Path(repo.path).resolve()
@@ -147,12 +245,6 @@ def _run_repo(
     saved_sha = None if full else state_store.read(repo.state_key or "")
 
     changed_paths, deleted_paths = _compute_changes(repo_root, saved_sha, head_sha, full)
-    changed_filtered = _filter_allowed(
-        repo_root=repo_root,
-        include_ext=settings.indexing.include_extensions,
-        exclude_dirs=settings.indexing.exclude_dirs,
-        changed_paths=changed_paths,
-    )
     all_allowed_paths = sorted(
         path.relative_to(repo_root).as_posix()
         for path in iter_files(
@@ -161,17 +253,65 @@ def _run_repo(
             settings.indexing.exclude_dirs,
         )
     )
+    changed_filtered = _filter_allowed(
+        repo_root=repo_root,
+        include_ext=settings.indexing.include_extensions,
+        exclude_dirs=settings.indexing.exclude_dirs,
+        paths=changed_paths,
+    )
 
-    artifact_docs = []
+    if full:
+        backend.delete_by_prefix([f"{repo.name}/"])
+        graph_store.clear_repo(repo.name)
+        changed_filtered = list(all_allowed_paths)
+        deleted_paths = []
+
+    impacted_tables: set[str] = set()
+    impacted_metrics: set[str] = set()
+    docs = []
+    parsed_files = 0
+    hash_skipped_files = 0
+
+    deleted_filtered = sorted(set(deleted_paths))
+    if deleted_filtered:
+        deleted_namespaced = [_doc_source_path(repo.name, path) for path in deleted_filtered]
+        backend.delete_documents(deleted_namespaced)
+        for path in deleted_filtered:
+            facts = graph_store.delete_file(repo.name, path)
+            _collect_impacted_from_facts(facts, impacted_tables, impacted_metrics)
+
     for relative_path in changed_filtered:
         file_path = repo_root / relative_path
         if not file_path.exists():
             continue
+        content_hash = compute_file_hash(file_path)
+        previous_hash = graph_store.get_file_hash(repo.name, relative_path)
+        if (
+            settings.indexing.impact_reindex_enabled
+            and not full
+            and previous_hash == content_hash
+        ):
+            hash_skipped_files += 1
+            continue
+
         analysis = analyze_artifact(
             repo_root=repo_root,
             file_path=file_path,
             max_chars_per_doc=settings.indexing.max_chars_per_doc,
         )
+        graph_store.upsert_file_analysis(
+            repo=repo.name,
+            source_path=relative_path,
+            content_hash=content_hash,
+            commit_sha=head_sha,
+            analysis=analysis,
+        )
+        parsed_files += 1
+        for table_name in analysis.reads + analysis.writes:
+            impacted_tables.add(table_name.lower())
+        for metric in analysis.metrics:
+            impacted_metrics.add(metric.name.lower())
+
         artifact_doc = build_artifact_document(analysis=analysis, glue_catalog=glue_catalog)
         artifact_doc.source_path = _namespace_doc_path(repo.name, artifact_doc.source_path)
         if settings.backend.type == "aws_kb":
@@ -180,33 +320,22 @@ def _run_repo(
                 content=artifact_doc.content,
                 settings=settings,
             )
-        artifact_docs.append(artifact_doc)
+        docs.append(artifact_doc)
 
-    deleted_namespaced = [_doc_source_path(repo.name, path) for path in sorted(set(deleted_paths))]
-    if deleted_namespaced:
-        backend.delete_documents(deleted_namespaced)
-
-    # Structured docs are rebuilt from current repo state to keep table/metric/architecture docs authoritative.
-    structured_docs = []
-    if changed_filtered or deleted_namespaced or full:
-        full_analyses = []
-        for relative_path in all_allowed_paths:
-            file_path = repo_root / relative_path
-            if not file_path.exists():
-                continue
-            full_analyses.append(
-                analyze_artifact(
-                    repo_root=repo_root,
-                    file_path=file_path,
-                    max_chars_per_doc=settings.indexing.max_chars_per_doc,
-                )
-            )
-        structured_docs = build_structured_documents(
+    needs_structured_refresh = full or bool(changed_filtered) or bool(deleted_filtered)
+    if needs_structured_refresh:
+        force_all_structured = full or (not settings.indexing.impact_reindex_enabled)
+        structured_docs, stale_paths = _build_structured_docs_from_graph(
             repo_name=repo.name,
-            analyses=full_analyses,
-            glue_catalog=glue_catalog,
             commit_sha=head_sha,
+            graph_store=graph_store,
+            glue_catalog=glue_catalog,
+            impacted_tables=impacted_tables,
+            impacted_metrics=impacted_metrics,
+            force_all=force_all_structured,
         )
+        if stale_paths:
+            backend.delete_documents(stale_paths)
         if settings.backend.type == "aws_kb" and settings.indexing.contextual_retrieval_enabled:
             for doc in structured_docs:
                 doc.content = _with_contextual_sections(
@@ -214,12 +343,10 @@ def _run_repo(
                     content=doc.content,
                     settings=settings,
                 )
-        backend.delete_by_prefix([f"{repo.name}/entities/"])
+        docs.extend(structured_docs)
 
-    docs = artifact_docs + structured_docs
     if docs:
         backend.upsert_documents(docs)
-
     if repo.state_key:
         state_store.write(repo.state_key, head_sha)
 
@@ -229,8 +356,12 @@ def _run_repo(
         saved_sha=saved_sha,
         head_sha=head_sha,
         changed_files=len(changed_filtered),
-        deleted_files=len(deleted_namespaced),
+        deleted_files=len(deleted_filtered),
         indexed_docs=len(docs),
+        parsed_files=parsed_files,
+        hash_skipped_files=hash_skipped_files,
+        impacted_tables=len(impacted_tables),
+        impacted_metrics=len(impacted_metrics),
     )
 
 
@@ -284,19 +415,24 @@ def main() -> None:
         bedrock_agent_client=bedrock_agent,
     )
     glue_catalog = load_glue_catalog(glue_client, settings.aws.glue_databases)
+    graph_store = GraphStore(settings.indexing.graph_db_path)
 
     repo_results: list[RepoRunResult] = []
-    for repo in selected_repos:
-        repo_results.append(
-            _run_repo(
-                repo=repo,
-                settings=settings,
-                state_store=state_store,
-                glue_catalog=glue_catalog,
-                backend=backend,
-                full=args.full,
+    try:
+        for repo in selected_repos:
+            repo_results.append(
+                _run_repo(
+                    repo=repo,
+                    settings=settings,
+                    state_store=state_store,
+                    glue_catalog=glue_catalog,
+                    backend=backend,
+                    graph_store=graph_store,
+                    full=args.full,
+                )
             )
-        )
+    finally:
+        graph_store.close()
 
     backend_result = backend.finalize()
     print(

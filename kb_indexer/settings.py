@@ -40,6 +40,8 @@ class IndexingSettings:
     contextualizer_mode: str = "heuristic"
     contextualizer_command: str | None = None
     contextualizer_max_context_chars: int = 320
+    graph_db_path: str = ".kb_state/graph.db"
+    impact_reindex_enabled: bool = True
 
 
 @dataclass
@@ -186,6 +188,8 @@ def load_settings(config_path: str | Path) -> AppSettings:
         contextualizer_max_context_chars=int(
             _get(indexing_raw, "contextualizer_max_context_chars", 320)
         ),
+        graph_db_path=str(_get(indexing_raw, "graph_db_path", ".kb_state/graph.db")),
+        impact_reindex_enabled=bool(_get(indexing_raw, "impact_reindex_enabled", True)),
     )
 
     state = StateSettings(
