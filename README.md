@@ -1,29 +1,64 @@
-# EMR/Flink Knowledge Base Indexer (AWS Bedrock + S3 Vectors)
+# KnowledgeBuilder: Contextual Retrieval + Structured Data Docs
 
-Simple workflow:
+This project implements a modular indexing system for Spark/Flink repositories with:
 
-1. One-time bootstrap creates:
-   - S3 source bucket (documents)
-   - S3 Vector bucket + index
-   - Bedrock Knowledge Base (vector store = S3 Vectors)
-   - S3 data source with optional post-chunking Lambda
-2. Incremental runs:
-   - read last indexed commit SHA from S3
-   - `git diff` to find changed/deleted files
-   - build enriched docs from Spark/Flink code + Glue Catalog context
-   - upload only changed docs, delete removed docs
-   - start Bedrock ingestion job
-   - persist new SHA back to S3
+1. Evidence-based structured markdown generation.
+2. Contextual Retrieval (Anthropic pattern): contextualized chunks + hybrid retrieval.
+3. Backend adapters for:
+- AWS Bedrock Knowledge Base (`aws_kb`)
+- Local FAISS (`faiss`)
 
-## Prerequisites
+## What is implemented
 
-- Python 3.11+
-- `uv`
-- AWS credentials with access to:
-  - `bedrock-agent:*` (or narrowed create/list/get/start ingestion actions)
-  - `s3vectors:*` (or narrowed bucket/index actions)
-  - `s3:*` on your source bucket
-  - `glue:GetTables` for configured Glue databases
+### 1) Structured knowledge generation
+
+For each repository:
+- Artifact docs for changed files.
+- Table docs (`entities/tables/...`) combining:
+  - Code evidence (read/write refs)
+  - Glue Catalog schema/location when available
+- Metric docs (`entities/metrics/...`) from detected formulas.
+- Architecture overview (`entities/architecture/overview.md`).
+
+Each entity doc includes frontmatter-like metadata:
+- `entity_type`, `entity_id`, `repo`, `commit_sha`
+- `source_of_truth` (`glue_catalog` or `code_inference`)
+- `confidence` level
+- explicit evidence file paths
+
+Core code:
+- `kb_indexer/extractor.py`
+- `scripts/reindex.py`
+
+### 2) Contextual Retrieval mechanism
+
+Implemented in `kb_indexer/contextual_retrieval.py` and `kb_indexer/backends/faiss_local.py`:
+
+- Split documents into semantic chunks.
+- Generate chunk context:
+  - `heuristic` mode
+  - `external_command` mode (hook for Claude SDK / Strands)
+- Build contextual chunk text:
+  - `[Context] ... [Chunk] ...`
+- Local retrieval uses:
+  - dense retrieval (FAISS over contextual embeddings)
+  - sparse retrieval (BM25 over contextual chunk text)
+  - reciprocal rank fusion (RRF)
+  - optional rerank step (query overlap feature)
+
+This follows the contextual embedding + contextual BM25 + fusion strategy from Anthropic’s Contextual Retrieval article.
+
+### 3) Multi-repo incremental indexing
+
+- Configure multiple repositories in `kb_config.yaml`.
+- Per-repo commit SHA state stored in:
+  - `s3` (recommended for cron/fresh clones), or
+  - local file.
+- On each run:
+  - compute git diff from last indexed SHA
+  - update changed artifact docs
+  - delete removed docs
+  - rebuild entity docs per changed repo
 
 ## Setup
 
@@ -32,60 +67,94 @@ cp kb_config.example.yaml kb_config.yaml
 uv sync
 ```
 
-Edit `kb_config.yaml`:
-- fill AWS identifiers/ARNs
-- set `bootstrap.*` values for first-time provisioning
-- set `aws.knowledge_base_id` and `aws.data_source_id` after bootstrap
+Optional extras:
 
-## One-Time Bootstrap
+```bash
+# Local FAISS index + BM25
+uv sync --extra faiss
+
+# Better local embeddings
+uv sync --extra local-embeddings
+```
+
+## Configure repositories and backend
+
+Edit `kb_config.yaml`:
+
+- `repositories`: list of repos to index.
+- `backend.type`: `aws_kb` or `faiss`.
+- `state.backend`: `s3` or `local`.
+- `indexing.contextual_*`: contextual retrieval settings.
+
+### Context generation modes
+
+1. `indexing.contextualizer_mode: heuristic`
+- no LLM call, deterministic context synthesis.
+
+2. `indexing.contextualizer_mode: external_command`
+- your command receives JSON input via stdin and returns:
+```json
+{"context":"..."}
+```
+- example stub: `scripts/contextualize_chunk_stub.py`
+
+This is the hook for Claude Agent SDK or Strands-based context generation.
+
+## Reindex
+
+```bash
+uv run python scripts/reindex.py --config kb_config.yaml --print-plan
+```
+
+Force full:
+
+```bash
+uv run python scripts/reindex.py --config kb_config.yaml --full --print-plan
+```
+
+Subset:
+
+```bash
+uv run python scripts/reindex.py --config kb_config.yaml --repos spark-jobs flink-jobs
+```
+
+## Query
+
+Local FAISS (hybrid contextual retrieval):
+
+```bash
+uv run python scripts/search.py --config kb_config.yaml --query "which jobs build customer_ltv?" --top-k 8
+```
+
+AWS KB:
+
+```bash
+uv run python scripts/search.py --config kb_config.yaml --query "which tables feed gross margin metric?" --top-k 8
+```
+
+## Planner hooks (Claude/Strands)
+
+Planner decides embedding/chunking strategy before ingestion:
+
+```yaml
+planner:
+  mode: external_command
+  external_command:
+    command: uv run python scripts/agent_plan_stub.py
+```
+
+The command receives JSON on stdin and returns plan JSON on stdout.
+
+## Bedrock bootstrap
+
+One-time KB provisioning:
 
 ```bash
 uv run python scripts/bootstrap_kb.py --config kb_config.yaml --wait
 ```
 
-Command output includes `knowledge_base_id` and `data_source_id`. Put them in `kb_config.yaml`.
-
-## Incremental Reindex
-
-```bash
-uv run python scripts/reindex.py --config kb_config.yaml --repo .
-```
-
-Force a full rebuild:
-
-```bash
-uv run python scripts/reindex.py --config kb_config.yaml --repo . --full
-```
-
-## Local Cron Pattern
-
-If cron clones a fresh repo each run, state still works because last indexed SHA is stored in S3:
+## Cron pattern
 
 ```cron
-*/15 * * * * cd /tmp && rm -rf de-kb-run && git clone --depth=200 git@github.com:ORG/REPO.git de-kb-run && cd de-kb-run && uv sync --frozen && uv run python scripts/reindex.py --config kb_config.yaml --repo .
+*/15 * * * * cd /tmp && rm -rf kb-run && git clone --depth=200 git@github.com:xdanny/KnowledgeBuilder.git kb-run && cd kb-run && uv sync --frozen && uv run python scripts/reindex.py --config kb_config.yaml --print-plan
 ```
-
-## Lambda Chunker
-
-File: `lambda/chunker/app.py`
-
-- Implements Bedrock custom transformation for `POST_CHUNKING`
-- Splits large content into semantic-ish chunks with overlap
-- Adds metadata (`chunk_no`, `table_refs`) to each chunk
-
-Package and deploy:
-
-```bash
-cd lambda/chunker
-zip -r ../../chunker.zip app.py
-```
-
-Then create/update a Lambda function from `chunker.zip` and set:
-- `bootstrap.chunk_lambda_arn`
-- `bootstrap.intermediate_s3_uri`
-
-## Notes
-
-- The extractor uses heuristics for table reads/writes; tune regex in `kb_indexer/extractor.py`.
-- Glue context enrichment only includes databases listed in `aws.glue_databases`.
-- Bedrock ingestion remains incremental because only changed source objects are updated.

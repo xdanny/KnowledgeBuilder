@@ -156,6 +156,8 @@ def main() -> None:
         raise ValueError("bootstrap.bedrock_role_arn is required.")
     if not settings.bootstrap.embedding_model_arn:
         raise ValueError("bootstrap.embedding_model_arn is required.")
+    if not settings.aws.source_bucket:
+        raise ValueError("aws.source_bucket is required.")
     if not settings.bootstrap.knowledge_base_name:
         raise ValueError("bootstrap.knowledge_base_name is required.")
     if not settings.bootstrap.data_source_name:

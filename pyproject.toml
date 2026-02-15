@@ -6,7 +6,17 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "boto3>=1.40.67",
+  "numpy>=1.26.0",
   "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+faiss = [
+  "faiss-cpu>=1.8.0",
+  "rank-bm25>=0.2.2",
+]
+local-embeddings = [
+  "sentence-transformers>=3.0.1",
 ]
 
 [build-system]

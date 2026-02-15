@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +24,13 @@ TABLE_WRITE_PATTERNS = [
     ),
 ]
 
+SQL_METRIC_PATTERNS = [
+    re.compile(
+        r"""(?P<formula>(?:sum|avg|min|max|count)\s*\([^)]+\))\s+as\s+(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)""",
+        re.IGNORECASE,
+    )
+]
+
 
 @dataclass
 class KnowledgeDocument:
@@ -35,6 +42,23 @@ class KnowledgeDocument:
         clean_prefix = prefix.rstrip("/")
         normalized_source = self.source_path.replace("\\", "/")
         return f"{clean_prefix}/docs/{normalized_source}.md"
+
+
+@dataclass
+class MetricEvidence:
+    name: str
+    formula: str
+    source_path: str
+
+
+@dataclass
+class ArtifactAnalysis:
+    source_path: str
+    file_type: str
+    reads: list[str] = field(default_factory=list)
+    writes: list[str] = field(default_factory=list)
+    metrics: list[MetricEvidence] = field(default_factory=list)
+    content_preview: str = ""
 
 
 def iter_files(repo_root: Path, include_ext: list[str], exclude_dirs: list[str]) -> Iterable[Path]:
@@ -62,7 +86,17 @@ def parse_table_refs(text: str) -> tuple[list[str], list[str]]:
     return sorted(reads), sorted(writes)
 
 
-def _load_structured(path: Path) -> Any:
+def parse_metric_refs(text: str, source_path: str) -> list[MetricEvidence]:
+    metrics: list[MetricEvidence] = []
+    for pattern in SQL_METRIC_PATTERNS:
+        for match in pattern.finditer(text):
+            formula = match.group("formula").strip()
+            name = match.group("name").strip()
+            metrics.append(MetricEvidence(name=name, formula=formula, source_path=source_path))
+    return metrics
+
+
+def _load_structured(path: Path) -> tuple[Any, str]:
     suffix = path.suffix.lower()
     raw_text = path.read_text(encoding="utf-8", errors="ignore")
     if suffix in {".yaml", ".yml"}:
@@ -86,11 +120,66 @@ def _render_glue_context(
         info = glue_catalog.get(table_name.lower())
         if not info:
             continue
-        cols = ", ".join(info.get("columns", [])[:15]) or "n/a"
+        cols = ", ".join(info.get("columns", [])[:20]) or "n/a"
         lines.append(
             f"- `{table_name}` | location: `{info.get('location', 'n/a')}` | columns: {cols}"
         )
     return lines
+
+
+def analyze_artifact(
+    repo_root: Path,
+    file_path: Path,
+    max_chars_per_doc: int,
+) -> ArtifactAnalysis:
+    relative_path = file_path.relative_to(repo_root).as_posix()
+    parsed, raw_text = _load_structured(file_path)
+    capped_text = raw_text[:max_chars_per_doc]
+    reads, writes = parse_table_refs(capped_text)
+    metrics = parse_metric_refs(capped_text, source_path=relative_path)
+
+    if isinstance(parsed, dict):
+        preview = json.dumps(parsed, indent=2, default=str)[:7000]
+    else:
+        preview = capped_text[:3500]
+
+    return ArtifactAnalysis(
+        source_path=relative_path,
+        file_type=file_path.suffix.lower(),
+        reads=reads,
+        writes=writes,
+        metrics=metrics,
+        content_preview=preview,
+    )
+
+
+def build_artifact_document(
+    *,
+    analysis: ArtifactAnalysis,
+    glue_catalog: dict[str, dict[str, Any]],
+) -> KnowledgeDocument:
+    all_tables = sorted(set(analysis.reads + analysis.writes))
+    glue_lines = _render_glue_context(all_tables, glue_catalog)
+
+    lines = [
+        f"# Artifact: {analysis.source_path}",
+        "",
+        "## Metadata",
+        f"- Type: `{analysis.file_type}`",
+        f"- Table reads: {', '.join(analysis.reads) if analysis.reads else 'none'}",
+        f"- Table writes: {', '.join(analysis.writes) if analysis.writes else 'none'}",
+        f"- Metrics detected: {', '.join(m.name for m in analysis.metrics) if analysis.metrics else 'none'}",
+        "",
+    ]
+    if glue_lines:
+        lines.append("## Glue Context")
+        lines.extend(glue_lines)
+        lines.append("")
+    lines.append("## Content")
+    lines.append("```text")
+    lines.append(analysis.content_preview)
+    lines.append("```")
+    return KnowledgeDocument(source_path=analysis.source_path, content="\n".join(lines), kind="artifact")
 
 
 def build_document(
@@ -99,36 +188,129 @@ def build_document(
     glue_catalog: dict[str, dict[str, Any]],
     max_chars_per_doc: int,
 ) -> KnowledgeDocument:
-    relative_path = file_path.relative_to(repo_root).as_posix()
-    parsed, raw_text = _load_structured(file_path)
-    raw_text = raw_text[:max_chars_per_doc]
-    reads, writes = parse_table_refs(raw_text)
-    all_tables = sorted(set(reads + writes))
-    glue_lines = _render_glue_context(all_tables, glue_catalog)
+    analysis = analyze_artifact(repo_root=repo_root, file_path=file_path, max_chars_per_doc=max_chars_per_doc)
+    return build_artifact_document(analysis=analysis, glue_catalog=glue_catalog)
 
-    if isinstance(parsed, dict):
-        structured_preview = json.dumps(parsed, indent=2, default=str)[:6000]
-    else:
-        structured_preview = raw_text[:3000]
 
-    content = [
-        f"# Artifact: {relative_path}",
+def build_structured_documents(
+    *,
+    repo_name: str,
+    analyses: list[ArtifactAnalysis],
+    glue_catalog: dict[str, dict[str, Any]],
+    commit_sha: str,
+) -> list[KnowledgeDocument]:
+    docs: list[KnowledgeDocument] = []
+    table_usage: dict[str, dict[str, set[str]]] = {}
+    metric_usage: dict[str, MetricEvidence] = {}
+
+    for analysis in analyses:
+        for table_name in analysis.reads:
+            entry = table_usage.setdefault(table_name.lower(), {"reads": set(), "writes": set()})
+            entry["reads"].add(analysis.source_path)
+        for table_name in analysis.writes:
+            entry = table_usage.setdefault(table_name.lower(), {"reads": set(), "writes": set()})
+            entry["writes"].add(analysis.source_path)
+        for metric in analysis.metrics:
+            metric_usage.setdefault(metric.name.lower(), metric)
+
+    # Table docs
+    for table_name, usage in sorted(table_usage.items()):
+        glue_info = glue_catalog.get(table_name, {})
+        columns = glue_info.get("columns", [])
+        confidence = "high" if glue_info else "medium"
+        source_of_truth = "glue_catalog" if glue_info else "code_inference"
+        table_doc = [
+            f"# Table: {table_name}",
+            "",
+            "## Frontmatter",
+            f"- entity_type: table",
+            f"- entity_id: {table_name}",
+            f"- repo: {repo_name}",
+            f"- commit_sha: {commit_sha}",
+            f"- source_of_truth: {source_of_truth}",
+            f"- confidence: {confidence}",
+            "",
+            "## Schema",
+            f"- Location: `{glue_info.get('location', 'unknown')}`",
+            f"- Columns: {', '.join(columns) if columns else 'unknown'}",
+            "",
+            "## Evidence",
+            f"- Read by: {', '.join(sorted(usage['reads'])) if usage['reads'] else 'none'}",
+            f"- Written by: {', '.join(sorted(usage['writes'])) if usage['writes'] else 'none'}",
+        ]
+        docs.append(
+            KnowledgeDocument(
+                source_path=f"{repo_name}/entities/tables/{table_name}.md",
+                content="\n".join(table_doc),
+                kind="table",
+            )
+        )
+
+    # Metric docs
+    for metric_name, metric in sorted(metric_usage.items()):
+        metric_doc = [
+            f"# Metric: {metric_name}",
+            "",
+            "## Frontmatter",
+            "- entity_type: metric",
+            f"- entity_id: {metric_name}",
+            f"- repo: {repo_name}",
+            f"- commit_sha: {commit_sha}",
+            "- source_of_truth: code_inference",
+            "- confidence: low",
+            "",
+            "## Definition",
+            f"- Formula: `{metric.formula}`",
+            "",
+            "## Evidence",
+            f"- Source file: `{metric.source_path}`",
+        ]
+        docs.append(
+            KnowledgeDocument(
+                source_path=f"{repo_name}/entities/metrics/{metric_name}.md",
+                content="\n".join(metric_doc),
+                kind="metric",
+            )
+        )
+
+    # Architecture doc
+    produced_tables = sorted({table for analysis in analyses for table in analysis.writes})
+    consumed_tables = sorted({table for analysis in analyses for table in analysis.reads})
+    architecture_doc = [
+        f"# Architecture: {repo_name}",
         "",
-        f"- Type: `{file_path.suffix.lower()}`",
-        f"- Table reads: {', '.join(reads) if reads else 'none'}",
-        f"- Table writes: {', '.join(writes) if writes else 'none'}",
+        "## Frontmatter",
+        "- entity_type: architecture",
+        f"- entity_id: {repo_name}",
+        f"- repo: {repo_name}",
+        f"- commit_sha: {commit_sha}",
+        "- source_of_truth: generated",
+        "- confidence: medium",
         "",
+        "## Summary",
+        f"- Artifacts analyzed: {len(analyses)}",
+        f"- Produced tables: {', '.join(produced_tables) if produced_tables else 'none'}",
+        f"- Consumed tables: {', '.join(consumed_tables) if consumed_tables else 'none'}",
+        "",
+        "## Important Files",
     ]
-    if glue_lines:
-        content.append("## Glue Context")
-        content.extend(glue_lines)
-        content.append("")
-    content.append("## Content")
-    content.append("```text")
-    content.append(structured_preview)
-    content.append("```")
-
-    return KnowledgeDocument(source_path=relative_path, content="\n".join(content))
+    important = sorted(
+        analyses,
+        key=lambda a: len(a.reads) + len(a.writes) + len(a.metrics),
+        reverse=True,
+    )[:20]
+    for analysis in important:
+        architecture_doc.append(
+            f"- `{analysis.source_path}` | reads={len(analysis.reads)} writes={len(analysis.writes)} metrics={len(analysis.metrics)}"
+        )
+    docs.append(
+        KnowledgeDocument(
+            source_path=f"{repo_name}/entities/architecture/overview.md",
+            content="\n".join(architecture_doc),
+            kind="architecture",
+        )
+    )
+    return docs
 
 
 def load_glue_catalog(
@@ -148,9 +330,9 @@ def load_glue_catalog(
                     continue
                 full_name = f"{db_name}.{table_name}".lower()
                 columns = [
-                    c.get("Name")
-                    for c in table.get("StorageDescriptor", {}).get("Columns", [])
-                    if c.get("Name")
+                    column.get("Name")
+                    for column in table.get("StorageDescriptor", {}).get("Columns", [])
+                    if column.get("Name")
                 ]
                 catalog[full_name] = {
                     "columns": columns,
