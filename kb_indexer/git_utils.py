@@ -23,6 +23,65 @@ def git(cmd: list[str], cwd: Path) -> str:
     return result.stdout.strip()
 
 
+def ensure_repo_checkout(
+    *,
+    git_url: str,
+    checkout_path: Path,
+    git_branch: str | None = None,
+    git_ref: str = "HEAD",
+) -> Path:
+    checkout_path = checkout_path.resolve()
+    git_dir = checkout_path / ".git"
+
+    if not git_dir.exists():
+        checkout_path.parent.mkdir(parents=True, exist_ok=True)
+        clone_cmd = ["clone", "--depth", "200"]
+        if git_branch:
+            clone_cmd.extend(["--branch", git_branch])
+        clone_cmd.extend([git_url, str(checkout_path)])
+        subprocess.run(
+            ["git", *clone_cmd],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "fetch", "--all", "--prune"],
+            cwd=str(checkout_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    if git_branch:
+        subprocess.run(
+            ["git", "checkout", git_branch],
+            cwd=str(checkout_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "pull", "--ff-only", "origin", git_branch],
+            cwd=str(checkout_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    if git_ref and git_ref != "HEAD":
+        subprocess.run(
+            ["git", "checkout", git_ref],
+            cwd=str(checkout_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    return checkout_path
+
+
 def resolve_sha(repo_root: Path, rev: str = "HEAD") -> str:
     return git(["rev-parse", rev], repo_root)
 

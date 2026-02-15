@@ -1,0 +1,30 @@
+mode: aws
+repo_path: /absolute/path/to/your/spark-or-flink-repo
+repo_name: spark-jobs
+# Alternative source instead of repo_path:
+# repo_git_url: git@github.com:your-org/spark-jobs.git
+# repo_git_branch: main
+# repo_checkout_path: .kb_repos/spark-jobs
+
+aws:
+  region: us-east-1
+  source_bucket: my-bedrock-kb-source
+  source_prefix: kb-docs
+  knowledge_base_id: KBXXXXXXXXXX
+  data_source_id: DSXXXXXXXXXX
+  glue_databases:
+    - prod
+    - analytics
+
+state:
+  backend: s3
+  s3_bucket: my-bedrock-kb-source
+  s3_prefix: kb-state
+
+# Optional:
+# planner:
+#   mode: heuristic
+# indexing:
+#   contextualizer_mode: heuristic
+#   contextualizer_mode: bedrock
+#   contextualizer_model: us.anthropic.claude-3-5-haiku-20241022-v1:0

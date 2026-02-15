@@ -18,6 +18,9 @@ faiss = [
 local-embeddings = [
   "sentence-transformers>=3.0.1",
 ]
+llm-context = [
+  "litellm>=1.74.0",
+]
 
 [build-system]
 requires = ["hatchling"]

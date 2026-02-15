@@ -23,6 +23,8 @@ class RepoSettings:
     path: str
     git_ref: str = "HEAD"
     state_key: str | None = None
+    git_url: str | None = None
+    git_branch: str | None = None
 
 
 @dataclass
@@ -39,6 +41,10 @@ class IndexingSettings:
     contextual_chunk_overlap_chars: int = 220
     contextualizer_mode: str = "heuristic"
     contextualizer_command: str | None = None
+    contextualizer_model: str | None = None
+    contextualizer_max_tokens: int = 220
+    contextualizer_temperature: float = 0.0
+    contextualizer_cache_path: str = ".kb_state/context_cache.json"
     contextualizer_max_context_chars: int = 320
     graph_db_path: str = ".kb_state/graph.db"
     impact_reindex_enabled: bool = True
@@ -126,15 +132,53 @@ def _get(section: dict[str, Any], key: str, default: Any) -> Any:
 def _normalize_repositories(raw: dict[str, Any]) -> list[RepoSettings]:
     repos_raw = raw.get("repositories")
     if not repos_raw:
-        return [RepoSettings(name="default", path=".", git_ref="HEAD")]
+        repo_name = str(raw.get("repo_name") or "default")
+        repo_git_url = raw.get("repo_git_url")
+        repo_path_raw = raw.get("repo_path")
+        if repo_path_raw:
+            repo_path = str(repo_path_raw)
+        elif repo_git_url:
+            repo_path = str(raw.get("repo_checkout_path") or f".kb_repos/{repo_name}")
+        else:
+            repo_path = "."
+        repo_ref = str(raw.get("repo_ref") or "HEAD")
+        repo_state_key = raw.get("repo_state_key")
+        repo_git_branch = raw.get("repo_git_branch")
+        return [
+            RepoSettings(
+                name=repo_name,
+                path=repo_path,
+                git_ref=repo_ref,
+                state_key=str(repo_state_key) if repo_state_key else None,
+                git_url=str(repo_git_url) if repo_git_url else None,
+                git_branch=str(repo_git_branch) if repo_git_branch else None,
+            )
+        ]
 
     repos: list[RepoSettings] = []
     for idx, item in enumerate(repos_raw, start=1):
         name = str(item.get("name") or f"repo-{idx}")
-        path = str(item.get("path") or ".")
+        git_url = item.get("git_url")
+        path_raw = item.get("path")
+        if path_raw:
+            path = str(path_raw)
+        elif git_url:
+            path = str(item.get("checkout_path") or f".kb_repos/{name}")
+        else:
+            path = "."
         git_ref = str(item.get("git_ref") or "HEAD")
         state_key = item.get("state_key")
-        repos.append(RepoSettings(name=name, path=path, git_ref=git_ref, state_key=state_key))
+        git_branch = item.get("git_branch")
+        repos.append(
+            RepoSettings(
+                name=name,
+                path=path,
+                git_ref=git_ref,
+                state_key=str(state_key) if state_key else None,
+                git_url=str(git_url) if git_url else None,
+                git_branch=str(git_branch) if git_branch else None,
+            )
+        )
     return repos
 
 
@@ -151,6 +195,7 @@ def load_settings(config_path: str | Path) -> AppSettings:
         raise FileNotFoundError(f"Missing config file: {path}")
 
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    mode = str(_get(raw, "mode", "custom")).lower()
 
     aws_raw = raw.get("aws", {})
     indexing_raw = raw.get("indexing", {})
@@ -185,6 +230,12 @@ def load_settings(config_path: str | Path) -> AppSettings:
         ),
         contextualizer_mode=str(_get(indexing_raw, "contextualizer_mode", "heuristic")).lower(),
         contextualizer_command=_get(indexing_raw, "contextualizer_command", None),
+        contextualizer_model=_get(indexing_raw, "contextualizer_model", None),
+        contextualizer_max_tokens=int(_get(indexing_raw, "contextualizer_max_tokens", 220)),
+        contextualizer_temperature=float(_get(indexing_raw, "contextualizer_temperature", 0.0)),
+        contextualizer_cache_path=str(
+            _get(indexing_raw, "contextualizer_cache_path", ".kb_state/context_cache.json")
+        ),
         contextualizer_max_context_chars=int(
             _get(indexing_raw, "contextualizer_max_context_chars", 320)
         ),
@@ -278,6 +329,21 @@ def load_settings(config_path: str | Path) -> AppSettings:
         planner=planner,
     )
 
+    # Optional simplified mode presets.
+    if mode == "local":
+        if "backend" not in raw or "type" not in backend_raw:
+            settings.backend.type = "faiss"
+        if "state" not in raw or "backend" not in state_raw:
+            settings.state.backend = "local"
+        if "backend" not in raw or "aws_kb" not in backend_raw:
+            settings.backend.aws_kb.start_ingestion_job = False
+            settings.backend.aws_kb.wait_for_ingestion_job = False
+    elif mode == "aws":
+        if "backend" not in raw or "type" not in backend_raw:
+            settings.backend.type = "aws_kb"
+        if "state" not in raw or "backend" not in state_raw:
+            settings.state.backend = "s3"
+
     # Backward compatibility with older single-key state config.
     legacy_state_key = aws_raw.get("state_key")
     if legacy_state_key and settings.repositories:
@@ -289,7 +355,18 @@ def load_settings(config_path: str | Path) -> AppSettings:
         settings.state.s3_bucket = settings.aws.source_bucket
 
     for repo in settings.repositories:
+        if not repo.path and not repo.git_url:
+            raise ValueError(
+                f"Repository '{repo.name}' must define either path or git_url in config."
+            )
         if repo.state_key is None:
             repo.state_key = _state_key_for_repo(settings, repo)
+
+    allowed_contextualizer_modes = {"heuristic", "external_command", "bedrock", "litellm"}
+    if settings.indexing.contextualizer_mode not in allowed_contextualizer_modes:
+        raise ValueError(
+            "indexing.contextualizer_mode must be one of: "
+            f"{', '.join(sorted(allowed_contextualizer_modes))}"
+        )
 
     return settings

@@ -1,0 +1,19 @@
+mode: local
+repo_path: /absolute/path/to/your/spark-or-flink-repo
+repo_name: spark-jobs
+# Alternative source instead of repo_path:
+# repo_git_url: git@github.com:your-org/spark-jobs.git
+# repo_git_branch: main
+# repo_checkout_path: .kb_repos/spark-jobs
+
+# Optional overrides (all have defaults):
+# backend:
+#   faiss:
+#     embedding_provider: hash
+#     index_path: .kb_local/index.faiss
+# state:
+#   local_path: .kb_state/state.json
+# indexing:
+#   impact_reindex_enabled: true
+#   contextualizer_mode: heuristic   # heuristic | external_command | bedrock | litellm
+#   contextualizer_model: us.anthropic.claude-3-5-haiku-20241022-v1:0

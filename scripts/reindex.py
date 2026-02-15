@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,13 @@ from kb_indexer.extractor import (
     iter_files,
     load_glue_catalog,
 )
-from kb_indexer.git_utils import commit_exists, list_all_files, parse_git_changes, resolve_sha
+from kb_indexer.git_utils import (
+    commit_exists,
+    ensure_repo_checkout,
+    list_all_files,
+    parse_git_changes,
+    resolve_sha,
+)
 from kb_indexer.graph_store import GraphStore
 from kb_indexer.planner import build_plan
 from kb_indexer.settings import AppSettings, RepoSettings, load_settings
@@ -365,6 +371,18 @@ def _run_repo(
     )
 
 
+def _prepare_repo(repo: RepoSettings) -> RepoSettings:
+    if not repo.git_url:
+        return repo
+    checkout = ensure_repo_checkout(
+        git_url=repo.git_url,
+        checkout_path=Path(repo.path),
+        git_branch=repo.git_branch,
+        git_ref=repo.git_ref,
+    )
+    return replace(repo, path=str(checkout))
+
+
 def main() -> None:
     args = parse_args()
     settings = load_settings(args.config)
@@ -379,11 +397,15 @@ def main() -> None:
         selected_repos = [repo for repo in settings.repositories if repo.name in selected]
         if not selected_repos:
             raise ValueError(f"No repositories matched --repos {args.repos}")
+    selected_repos = [_prepare_repo(repo) for repo in selected_repos]
 
     context = {
         "repo_count": len(selected_repos),
         "backend": settings.backend.type,
-        "repos": [{"name": repo.name, "path": repo.path} for repo in selected_repos],
+        "repos": [
+            {"name": repo.name, "path": repo.path, "git_url": repo.git_url, "git_branch": repo.git_branch}
+            for repo in selected_repos
+        ],
     }
     plan = build_plan(settings, context)
     if args.print_plan:

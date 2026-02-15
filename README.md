@@ -19,6 +19,7 @@ KnowledgeBuilder builds a data-engineering knowledge base from code + Glue metad
   - SQLite graph tables for files, refs, symbols, call edges.
 - Reindex orchestrator (`scripts/reindex.py`):
   - Reads git diff, applies hash-skip, updates graph, regenerates impacted docs.
+  - Supports repo `path` or `git_url` (clone/pull before indexing).
 - Retrieval:
   - Local hybrid retrieval in `faiss` mode (`scripts/search.py`).
   - Bedrock retrieval in `aws_kb` mode (`scripts/search.py`).
@@ -36,7 +37,7 @@ KnowledgeBuilder builds a data-engineering knowledge base from code + Glue metad
 
 ```bash
 cd /Users/dan/Documents/New\ project
-cp kb_config.example.yaml kb_config.yaml
+cp kb_config.local.example.yaml kb_config.yaml
 uv sync
 ```
 
@@ -48,7 +49,39 @@ uv sync --extra faiss
 
 # Optional better local embeddings for FAISS
 uv sync --extra local-embeddings
+
+# Optional LiteLLM contextualizer mode
+uv sync --extra llm-context
 ```
+
+## Simplest Setup (Recommended)
+
+Use one of the mode-specific templates instead of the full config:
+
+1. Local mode:
+
+```bash
+cp kb_config.local.example.yaml kb_config.yaml
+```
+
+2. AWS mode:
+
+```bash
+cp kb_config.aws.example.yaml kb_config.yaml
+```
+
+Then edit only the required fields.
+
+`mode` presets:
+
+1. `mode: local` defaults to local state + FAISS backend.
+2. `mode: aws` defaults to S3 state + AWS KB backend.
+
+Single-repo shorthand:
+
+1. `repo_path` and `repo_name` can replace the full `repositories:` list.
+2. Or use `repo_git_url` (+ optional `repo_git_branch`, `repo_checkout_path`) instead of `repo_path`.
+3. Use `repositories:` only when indexing multiple repos.
 
 ## Quickstart A: Local Mode (FAISS)
 
@@ -56,75 +89,22 @@ This is the fastest way to start.
 
 ### 1) Minimal `kb_config.yaml` for local mode
 
-Use this as a starting point:
+Use this as a starting point (or copy `kb_config.local.example.yaml`):
 
 ```yaml
-aws:
-  region: us-east-1
-  source_bucket:
-  source_prefix: kb-docs
-  knowledge_base_id:
-  data_source_id:
-  glue_databases: []
+mode: local
+repo_path: /absolute/path/to/your/spark-or-flink-repo
+repo_name: spark-jobs
+```
 
-repositories:
-  - name: spark-jobs
-    path: /absolute/path/to/your/spark-or-flink-repo
-    git_ref: HEAD
+Git source alternative:
 
-state:
-  backend: local
-  local_path: .kb_state/state.json
-  s3_bucket:
-  s3_prefix: kb-state
-
-backend:
-  type: faiss
-  aws_kb:
-    start_ingestion_job: false
-    wait_for_ingestion_job: false
-  faiss:
-    index_path: .kb_local/index.faiss
-    metadata_path: .kb_local/metadata.json
-    embedding_provider: hash
-    embedding_model: sentence-transformers/all-MiniLM-L6-v2
-    embedding_dimension: 768
-    normalize_embeddings: true
-    bm25_enabled: true
-    rrf_k: 60
-    rerank_enabled: true
-    initial_retrieval_k: 150
-
-planner:
-  mode: heuristic
-  external_command:
-    command:
-
-indexing:
-  include_extensions: [".py", ".scala", ".sql", ".yaml", ".yml", ".json"]
-  exclude_dirs: [".git", ".venv", "venv", "__pycache__", "target", "build"]
-  max_chars_per_doc: 45000
-  contextual_retrieval_enabled: true
-  contextual_chunk_size_chars: 1800
-  contextual_chunk_overlap_chars: 220
-  contextualizer_mode: heuristic
-  contextualizer_command:
-  contextualizer_max_context_chars: 320
-  graph_db_path: .kb_state/graph.db
-  impact_reindex_enabled: true
-
-bootstrap:
-  knowledge_base_name:
-  data_source_name:
-  bedrock_role_arn:
-  embedding_model_arn:
-  vector_bucket_name:
-  vector_index_name:
-  vector_dimension: 1024
-  vector_distance_metric: cosine
-  chunk_lambda_arn:
-  intermediate_s3_uri:
-  context_enrichment_model_arn:
+```yaml
+mode: local
+repo_git_url: git@github.com:your-org/spark-jobs.git
+repo_git_branch: main
+repo_checkout_path: .kb_repos/spark-jobs
+repo_name: spark-jobs
 ```
 
 ### 2) Run first index
@@ -152,36 +132,27 @@ uv run python scripts/search.py --config kb_config.yaml --query "which jobs writ
 
 Use this when you want managed KB ingestion/retrieval.
 
-### 1) Set backend + state
+### 1) Start from AWS template
 
-In `kb_config.yaml`:
+```bash
+cp kb_config.aws.example.yaml kb_config.yaml
+```
 
-1. Set `backend.type: aws_kb`.
-2. Set `state.backend: s3`.
-3. Set `state.s3_bucket` (or reuse `aws.source_bucket`).
+### 2) Set required fields
 
-### 2) Fill bootstrap values
+1. `repo_path`
+2. `aws.source_bucket`
+3. `aws.knowledge_base_id`
+4. `aws.data_source_id`
+5. `state.s3_bucket`
 
-Set:
+### 3) Optional bootstrap once (if KB is not created yet)
 
-1. `bootstrap.knowledge_base_name`
-2. `bootstrap.data_source_name`
-3. `bootstrap.bedrock_role_arn`
-4. `bootstrap.embedding_model_arn`
-5. `bootstrap.vector_bucket_name`
-6. `bootstrap.vector_index_name`
-7. `aws.source_bucket`
-
-### 3) Bootstrap once
+Fill `bootstrap.*` values and run:
 
 ```bash
 uv run python scripts/bootstrap_kb.py --config kb_config.yaml --wait
 ```
-
-Copy output IDs into config:
-
-1. `aws.knowledge_base_id`
-2. `aws.data_source_id`
 
 ### 4) Run indexing
 
@@ -228,11 +199,24 @@ Config keys:
 3. `indexing.contextual_chunk_overlap_chars`
 4. `indexing.contextualizer_mode`
 5. `indexing.contextualizer_command`
+6. `indexing.contextualizer_model`
+7. `indexing.contextualizer_cache_path`
+8. `indexing.contextualizer_max_tokens`
+9. `indexing.contextualizer_temperature`
 
 Modes:
 
 1. `heuristic`: zero-model-cost context generation.
 2. `external_command`: your command receives JSON on stdin and returns `{"context":"..."}`.
+3. `bedrock`: built-in Bedrock runtime call using `contextualizer_model`.
+4. `litellm`: built-in LiteLLM call using `contextualizer_model`.
+
+Notes:
+
+1. Planner and contextualizer are separate systems.
+2. Planner decides ingest strategy once per run.
+3. Contextualizer enriches every chunk and can use a cheaper model.
+4. `contextualizer_cache_path` avoids paying again for unchanged chunks.
 
 Stub script:
 
@@ -264,6 +248,18 @@ Stub script:
 uv run python scripts/agent_plan_stub.py
 ```
 
+## Planner vs Contextualizer (Important)
+
+1. Planner (`planner.*`) is for orchestration decisions:
+- backend selection
+- embedding provider/model choice
+- chunk size/overlap
+2. Contextualizer (`indexing.contextualizer_*`) is for per-chunk context generation.
+3. You can keep planner heuristic and still run LLM contextualization.
+4. Recommended cost setup:
+- planner: `heuristic`
+- contextualizer mode: `bedrock` with a small model, or `litellm` with a low-cost model.
+
 ## Cron / Automation
 
 For stateless periodic runs:
@@ -293,9 +289,10 @@ uv sync --extra faiss
 
 Check:
 
-1. `repositories[].path` exists and is a git repo.
-2. `indexing.include_extensions` includes your file types.
-3. `indexing.exclude_dirs` is not excluding too much.
+1. You configured either `repositories[].path` or `repositories[].git_url` (or shorthand `repo_path` / `repo_git_url`).
+2. If using `git_url`, verify credentials and network access for clone/pull.
+3. `indexing.include_extensions` includes your file types.
+4. `indexing.exclude_dirs` is not excluding too much.
 
 ### AWS ingestion not starting
 
@@ -318,4 +315,7 @@ Check:
 2. Reindex flow: `scripts/reindex.py`
 3. Parser/extraction: `kb_indexer/extractor.py`
 4. Graph store: `kb_indexer/graph_store.py`
-5. Search: `scripts/search.py`
+5. Minimal local config: `kb_config.local.example.yaml`
+6. Minimal AWS config: `kb_config.aws.example.yaml`
+7. Full config template: `kb_config.example.yaml`
+8. Search: `scripts/search.py`

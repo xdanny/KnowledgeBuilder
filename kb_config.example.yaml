@@ -1,3 +1,5 @@
+mode: custom
+
 aws:
   region: us-east-1
   source_bucket: my-bedrock-kb-source
@@ -10,7 +12,11 @@ aws:
 
 repositories:
   - name: spark-jobs
+    # Use local path OR git_url (+ optional checkout_path)
     path: /path/to/spark-repo
+    # git_url: git@github.com:your-org/spark-repo.git
+    # git_branch: main
+    # checkout_path: .kb_repos/spark-jobs
     git_ref: HEAD
     # Optional override. If missing, default is kb-state/<repo-name>/last_indexed_sha.txt
     # state_key: kb-state/spark-jobs/last_indexed_sha.txt
@@ -72,8 +78,13 @@ indexing:
   contextual_retrieval_enabled: true
   contextual_chunk_size_chars: 1800
   contextual_chunk_overlap_chars: 220
-  # heuristic | external_command
+  # heuristic | external_command | bedrock | litellm
   contextualizer_mode: heuristic
+  # Used by bedrock or litellm contextualizer modes.
+  contextualizer_model:
+  contextualizer_max_tokens: 220
+  contextualizer_temperature: 0.0
+  contextualizer_cache_path: .kb_state/context_cache.json
   # Example: uv run python scripts/contextualize_chunk_stub.py
   contextualizer_command:
   contextualizer_max_context_chars: 320
