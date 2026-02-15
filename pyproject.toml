@@ -1,0 +1,14 @@
+[project]
+name = "emr-kb-indexer"
+version = "0.1.0"
+description = "Incremental Bedrock Knowledge Base indexing for Spark/Flink repos."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boto3>=1.40.67",
+  "PyYAML>=6.0.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

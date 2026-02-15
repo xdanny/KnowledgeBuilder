@@ -1,0 +1,42 @@
+aws:
+  region: us-east-1
+  source_bucket: my-bedrock-kb-source
+  source_prefix: kb-docs
+  state_key: kb-state/last_indexed_sha.txt
+  knowledge_base_id: KBXXXXXXXXXX
+  data_source_id: DSXXXXXXXXXX
+  glue_databases:
+    - prod
+    - analytics
+
+bootstrap:
+  knowledge_base_name: de-knowledge-base
+  data_source_name: de-repo-source
+  bedrock_role_arn: arn:aws:iam::123456789012:role/bedrock-kb-service-role
+  embedding_model_arn: arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0
+  vector_bucket_name: de-kb-vectors
+  vector_index_name: de-kb-index
+  vector_dimension: 1024
+  vector_distance_metric: cosine
+  chunk_lambda_arn: arn:aws:lambda:us-east-1:123456789012:function:bedrock-kb-chunker
+  intermediate_s3_uri: s3://my-bedrock-kb-source/bedrock-kb-intermediate/
+  context_enrichment_model_arn:
+
+indexing:
+  include_extensions:
+    - .py
+    - .scala
+    - .sql
+    - .yaml
+    - .yml
+    - .json
+  exclude_dirs:
+    - .git
+    - .venv
+    - venv
+    - __pycache__
+    - target
+    - build
+  max_chars_per_doc: 45000
+  start_ingestion_job: true
+  wait_for_ingestion_job: false
