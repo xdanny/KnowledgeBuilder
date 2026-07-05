@@ -36,7 +36,8 @@ KnowledgeBuilder builds a data-engineering knowledge base from code + Glue metad
 ## Install
 
 ```bash
-cd /Users/dan/Documents/New\ project
+git clone https://github.com/xdanny/KnowledgeBuilder.git
+cd KnowledgeBuilder
 cp kb_config.local.example.yaml kb_config.yaml
 uv sync
 ```
